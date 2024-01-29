@@ -66,7 +66,7 @@ wf.add_workflow_settings_cli(parser)
 args = parser.parse_args()
 
 # By default, we do logging.info, each --verbose adds a level of verbosity
-logging_level = args.verbose + 1 if args.verbose else 1
+logging_level = args.verbose + 1 if args.verbose else logging.INFO
 pycbc.init_logging(logging_level)
 
 container = wf.Workflow(args, args.workflow_name)
@@ -178,6 +178,7 @@ bank_plot = wf.make_template_plot(workflow, hdfbank,
 ######################## Setup the FULL DATA run ##############################
 output_dir = "full_data"
 
+
 # setup the matchedfilter jobs
 ind_insps = insps = wf.setup_matchedfltr_workflow(workflow, analyzable_segs,
                                    datafind_files, splitbank_files_fd,
@@ -187,18 +188,90 @@ insps = wf.merge_single_detector_hdf_files(workflow, hdfbank,
                                            insps, output_dir,
                                            tags=['full_data'])
 
+# Check for the only-do section. If inspiral=true then it will only do the workflow up until the merged inspiral hdf files
+if 'only-do' in workflow.cp.sections():
+    only_do_inspiral = workflow.cp.get('only-do', 'inspiral', fallback='false').lower() == 'true'
+else:
+    only_do_inspiral = False
+
+if only_do_inspiral:
+    # Finalization code
+    log_file_html = wf.File(workflow.ifos, 'WORKFLOW-LOG', workflow.analysis_time,
+                            extension='.html', directory=rdir['workflow'])
+
+    gen_file_html = wf.File(workflow.ifos, 'WORKFLOW-GEN', workflow.analysis_time,
+                            extension='.html', directory=rdir['workflow'])
+
+    dashboard_file = wf.File(workflow.ifos, 'DASHBOARD', workflow.analysis_time,
+                             extension='.html', directory=rdir['workflow'])
+    dashboard_str = """<center><p style="font-size:20px"><b><a href="PEGASUS_DASHBOARD_URL" target="_blank">Pegasus Dashboard Page</a></b></p></center>"""
+    kwds = {'title': "Pegasus Dashboard",
+            'caption': "Link to Pegasus Dashboard",
+            'cmd': "PYCBC_SUBMIT_DAX_ARGV", }
+    save_fig_with_metadata(dashboard_str, dashboard_file.storage_path, **kwds)
+
+    # Create pages for the submission script to write data
+    wf.makedir(rdir['workflow/dax'])
+    wf.makedir(rdir['workflow/input_map'])
+    wf.makedir(rdir['workflow/output_map'])
+    wf.makedir(rdir['workflow/planning'])
+
+    container += workflow
+    container += finalize_workflow
+
+    container.add_subworkflow_dependancy(workflow, finalize_workflow)
+    container.save()
+    
+    logging.info("Written dax.")
+
+    logging.shutdown()
+    with open(wf_log_file.storage_path, "r") as logfile:
+        logdata = logfile.read()
+    log_str = """
+    <p>Workflow generation script created workflow in output directory: %s</p>
+    <p>Workflow name is: %s</p>
+    <p>Workflow generation script run on host: %s</p>
+    <pre>%s</pre>
+    """ % (os.getcwd(), args.workflow_name, socket.gethostname(), logdata)
+    kwds = {'title': 'Workflow Generation Log',
+            'caption': "Log of the workflow script %s" % sys.argv[0],
+            'cmd': ' '.join(sys.argv), }
+    save_fig_with_metadata(log_str, log_file_html.storage_path, **kwds)
+
+    args_to_output = [sys.argv[0]]
+    for arg in sys.argv[1:]:
+        if arg.startswith('--'):
+            # This is an option, add tab
+            args_to_output.append('  ' + arg)
+        else:
+            # This is a parameter, add two tabs
+            args_to_output.append('    ' + arg)
+
+    gen_str = '<pre>' + ' \\\n'.join(args_to_output) + '</pre>'
+    kwds = {'title': 'Workflow Generation Command',
+            'caption': "Command used to generate the workflow.",
+            'cmd': ' '.join(sys.argv), }
+    save_fig_with_metadata(gen_str, gen_file_html.storage_path, **kwds)
+    layout.single_layout(rdir['workflow'], ([dashboard_file, gen_file_html, log_file_html]))
+    sys.exit(0)
+
+
 # setup sngl trigger distribution fitting jobs
-# 'statfiles' is list of files used in calculating statistic
+# 'statfiles' is list of files used in calculating coinc statistic
 # 'dqfiles' is the subset of files containing data quality information
 statfiles = []
-
-dqfiles, dqfile_labels = wf.setup_dq_reranking(workflow, insps,
-                                               hdfbank, analyzable_file,
-                                               analyzable_name,
-                                               dq_segment_file,
-                                               output_dir='dq',
-                                               tags=['full_data'])
-statfiles += dqfiles
+dqfiles = []
+dqfile_labels = []
+dq_labels = workflow.cp.get_subsections('workflow-data_quality')
+for dq_label in dq_labels:
+    dq_label_files = wf.setup_dq_reranking(workflow, dq_label, insps, hdfbank,
+                                       analyzable_segs, analyzable_file,
+                                       dq_segment_file,
+                                       output_dir='dq',
+                                       tags=['full_data'])
+    statfiles += dq_label_files
+    dqfiles += dq_label_files
+    dqfile_labels += len(dq_label_files) * [dq_label]
 
 statfiles += wf.setup_trigger_fitting(workflow, insps, hdfbank,
                                       final_veto_file, final_veto_name,
@@ -454,8 +527,7 @@ for insp_file in full_insps:
         wf.setup_single_det_minifollowups\
             (workflow, insp_file, hdfbank, insp_files_seg_file,
              data_analysed_name, trig_generated_name, 'daxes', currdir,
-             statfiles=wf.FileList(statfiles),
-             fg_file=censored_veto, fg_name='closed_box',
+             veto_file=censored_veto, veto_segment_name='closed_box',
              tags=insp_file.tags + [subsec])
 
 ##################### COINC FULL_DATA plots ###################################
@@ -550,18 +622,32 @@ for key in final_bg_files:
 
 # DQ log likelihood plots
 for dqf, dql in zip(dqfiles, dqfile_labels):
-    # plot rates when flag was on
-    outdir = rdir[f'data_quality/{dqf.ifo}_{dql}_trigger_rates']
-    wf.make_dq_flag_trigger_rate_plot(workflow, dqf, dql, outdir, tags=[dql])
+    dq_type = workflow.cp.get_opt_tags('workflow-data_quality', 'dq-type', tags=[dql])
+    tags = [dql, 'full_data']
+    if dq_type == 'timeseries':
+        # plot rates as function of time
+        outdir = rdir[f'data_quality/{dqf.ifo}_{dql}_trigger_rates']
+        wf.make_dq_timeseries_trigger_rate_plot(workflow, [dqf], outdir,
+                                                tags=tags)
+        # plot rates as function of dq percentile
+        outdir = rdir[f'data_quality/{dqf.ifo}_{dql}_percentiles']
+        wf.make_dq_percentile_plot(workflow, [dqf], outdir, tags=tags)
+    elif dq_type == 'flag':
+        # plot rates when flag was on
+        outdir = rdir[f'data_quality/{dqf.ifo}_{dql}_trigger_rates']
+        wf.make_dq_flag_trigger_rate_plot(workflow, [dqf], outdir, tags=[dql])
 
 # DQ background binning plot
-ifo_bins = workflow.cp.get_subsections('bin_templates')
-for ifo in ifo_bins:
-    background_bins = workflow.cp.get_opt_tags(
-        'bin_templates', 'background-bins', tags=[ifo])
-    wf.make_template_plot(workflow, hdfbank, rdir['data_quality'],
-                          bins=background_bins,
-                          tags=[ifo, 'dq_bins'] + bank_tags)
+if workflow.cp.has_option_tags('bin_trigger_rates_dq', 'background-bins',
+                               tags=None):
+    background_bins = workflow.cp.get_opt_tags('bin_trigger_rates_dq',
+                                               'background-bins', tags=None)
+    bank_tags = workflow.cp.get_subsections('plot_bank')
+    if len(bank_tags) == 0:
+        bank_tags = ['bank']
+    for b_tag in bank_tags:
+        wf.make_template_plot(workflow, hdfbank, rdir['data_quality'],
+                              bins=background_bins, tags=['dq_bins', b_tag])
 
 ############################## Setup the injection runs #######################
 
@@ -572,14 +658,13 @@ splitbank_files_inj = wf.setup_splittable_workflow(workflow, [hdfbank],
 # setup the injection files
 inj_files_base, inj_tags = wf.setup_injection_workflow(workflow,
                                                   output_dir="inj_files")
-
-inj_files = []
-for inj_file, tag in zip(inj_files_base, inj_tags):
-    inj_files.append(wf.inj_to_hdf(workflow, inj_file, 'inj_files', [tag]))
+#load the files from the injection workflow
+inj_files = inj_files_base
 
 inj_coincs = wf.FileList()
 
 found_inj_dict ={}
+
 insps_dict = {}
 
 files_for_combined_injfind = []
